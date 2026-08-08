@@ -1,0 +1,30 @@
+[Unit]
+Description=Protector - eBPF zero-trust quarantine firewall (zqfw)
+Documentation=https://github.com/blah-blah-cell/protector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Attaches to the default-route interface and starts in monitor mode so it never
+# drops traffic until you toggle enforcement (SIGUSR1).
+ExecStart=/usr/local/bin/zqfw --iface auto --block-ip --monitor --audit /var/log/zqfw/audit.jsonl --metrics-addr 127.0.0.1:9900
+ExecReload=/bin/kill -USR1 $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# The daemon loads eBPF programs and attaches probes, so it needs root and the
+# BPF/caps in addition to network admin.
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+
+# Notes
+#   * Run as root: loading BPF objects requires CAP_BPF + CAP_SYS_ADMIN (and
+#     the unprivileged_bpf sysctl must allow it, or the process must be root).
+#   * If you prefer a non-root user, install the binary with file capabilities:
+#       sudo setcap cap_bpf,cap_sys_admin,cap_net_admin,cap_net_raw=eip /usr/local/bin/zqfw
+#   * .service files are usually also usable as a strict hardening template;
+#     adjust ProtectSystem/ProtectHome according to your logging needs.
