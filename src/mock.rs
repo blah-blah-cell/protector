@@ -12,6 +12,7 @@ use crate::bpf::DataPlane;
 use crate::config::Config;
 use crate::protocol::*;
 
+#[derive(Debug)]
 pub struct MockDataPlane {
     pub flows: HashMap<FlowKey, FlowMetrics>,
     pub blocklist: HashSet<FlowKey>,
@@ -117,6 +118,13 @@ impl DataPlane for MockDataPlane {
 
     fn ingest_packet(&mut self, key: &FlowKey, len: u32, ts_ns: u64, flags: u8) -> bool {
         self.process_packet(key, len, ts_ns, flags)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 

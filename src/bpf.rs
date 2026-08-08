@@ -151,6 +151,10 @@ pub trait DataPlane {
     fn ingest_packet(&mut self, _key: &FlowKey, _len: u32, _ts_ns: u64, _flags: u8) -> bool {
         false
     }
+
+    /// Downcast helper for tests.
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 impl DataPlane for BpfManager {
@@ -203,6 +207,13 @@ impl DataPlane for BpfManager {
 
     fn event_fd(&self) -> Option<std::os::fd::OwnedFd> {
         Some(self.ringbuf_fd())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 

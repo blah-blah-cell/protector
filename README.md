@@ -126,6 +126,78 @@ sudo zqfw --iface eth0 --block-ip --monitor --reap-interval 2s --quarantine 30s
   `zqfw_block_hits_total`, `zqfw_quarantined_ips`, ...
 * **Signals**: SIGUSR1 toggle, SIGUSR2 session dump.
 
+## Security model
+
+### What a quarantine actually blocks
+
+The word "quarantine" covers two distinct kernel-map actions. Read them
+literally — this matters operationally:
+
+| decision | kernel map | scope | direction |
+|----------|------------|-------|-----------|
+| `quarantine` (flow) | `blocklist` | one `src ip:port → dst ip:port` proto, plus its **reverse** direction | blocks only that session, both ways |
+| `quarantine_ip` (IP) | `blocklist_ip` | the whole **source IP** | blocks **all traffic from that IP** on the attached interface |
+
+Scope boundaries:
+
+* **Per-interface, not per-host**: probes attach to the interface chosen at
+  startup (`--iface`, default `auto`). Traffic on other interfaces or
+  namespaces is unaffected. There is no netfilter/iptables bridge mode.
+* **Ingress (XDP) + egress (TC) on that NIC**: both directions of the wire are
+  seen; the reverse of a quarantined flow is blocked too (zero-trust).
+* **IPv4 + IPv6** flow keys are supported. Non-IP and unknown Ethernet frames,
+  and malformed packets, are **counted and passed** (fail-open; see below).
+
+### Fail-open vs fail-closed
+
+The policy is **fail-open by default by design**:
+
+* **Daemon crash/exit** → the process dies, the kernel unbinds the BPF objects,
+  and all traffic flows again. A crash can never leave the host locked out.
+  The trade-off: a crashed or stuck daemon also stops protecting you.
+* **Kernel map lookup failure** (map full/unavailable) → treated as "not
+  blocked" → **pass**.
+* **Fields beyond the BPF verifier's parse scope**: malformed packets → counted as
+  `malformed`, **passed**.
+* **Events-ring overflow** → `events_lost` counter increments (decisions are
+  unaffected; they run off the flow map snapshot).
+
+Two deliberate exceptions where it is **fail-closed**:
+
+* If the `ctl` map lookup itself fails, the probes default to
+  `ZQFW_MODE_ENFORCE` so a policy-controller failure does not silently weaken
+  blocking that is already in force.
+* Anything already in the blocklist stays blocked until the **userspace
+  supervisor** expires it (TTL) and issues the `unblock` — if the supervisor is
+  dead, TTL expiry stops and the block persists until the maps are torn down.
+
+If you need **fail-closed** at the network level (drop-everything when the
+daemon dies), pair zqfw with the host firewall (`iptables -P ... DROP`), or run
+it in its own namespace where the namespace teardown kills the interface. This
+is a policy choice, not something the XDP program should guess.
+
+### Threat model and assumptions
+
+Protects against (in-scope):
+
+* Rapid recon: port scans, SYN floods, DNS tunneling, data exfiltration,
+  lateral movement to internal services, first-contact chatter, RST floods,
+  slow-drip.
+
+Explicitly **out of scope** today:
+
+* Encrypted (TLS) flow inspection, fragmentation IP reassembly, IPsec/overlay
+  (VxLAN/GRE, geneve) in the probe, and NAT defeats flow-key orientation.
+* Off-path / root adversary with access to the box — they can unload
+  probes or read the maps. Threat model assumes the host is trusted, the
+  network is not.
+* Large ACL evolution (whole ASN ranges) — use a real IDS/IPS for that.
+
+Because each blocked host recovers automatically after `--quarantine` seconds,
+the cost of a false positive is bounded: a transient drop of one host for one
+window, not a permanent outage. This bounded-loss property is what makes
+monitor-first + aggressive signals deployable.
+
 ## Architecture
 
 ```
