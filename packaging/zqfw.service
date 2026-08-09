@@ -5,26 +5,73 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 # Attaches to the default-route interface and starts in monitor mode so it never
 # drops traffic until you toggle enforcement (SIGUSR1).
+# Use Type=notify so systemd can track readiness.
 ExecStart=/usr/local/bin/zqfw --iface auto --block-ip --monitor --audit /var/log/zqfw/audit.jsonl --metrics-addr 127.0.0.1:9900
 ExecReload=/bin/kill -USR1 $MAINPID
-Restart=on-failure
+Restart=always
 RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
-# The daemon loads eBPF programs and attaches probes, so it needs root and the
-# BPF/caps in addition to network admin.
+# Systemd watchdog: if daemon doesn't ping within WatchdogSec, systemd restarts it.
+# The daemon must call sd_notify(0, "WATCHDOG=1") periodically.
+WatchdogSec=30
+
+# Hardening
 User=root
 Group=root
+NoNewPrivileges=false  # Required for BPF loading
+CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_BPF CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+
+# Filesystem protection
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service @clock @network @bpf @resources @file-system
+
+# Logging directory
+StateDirectory=zqfw
+LogsDirectory=zqfw
+CacheDirectory=zqfw
+
+# Resource limits
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+MemoryMax=512M
+CPUQuota=200%
+
+# Environment
+EnvironmentFile=-/etc/default/zqfw
+
+# Pre-start: ensure logging directory exists
+ExecStartPre=/bin/mkdir -p /var/log/zqfw
+ExecStartPre=/bin/chown root:root /var/log/zqfw
+ExecStartPre=/bin/chmod 750 /var/log/zqfw
 
 [Install]
 WantedBy=multi-user.target
 
-# Notes
-#   * Run as root: loading BPF objects requires CAP_BPF + CAP_SYS_ADMIN (and
-#     the unprivileged_bpf sysctl must allow it, or the process must be root).
-#   * If you prefer a non-root user, install the binary with file capabilities:
-#       sudo setcap cap_bpf,cap_sys_admin,cap_net_admin,cap_net_raw=eip /usr/local/bin/zqfw
-#   * .service files are usually also usable as a strict hardening template;
-#     adjust ProtectSystem/ProtectHome according to your logging needs.
+# Notes:
+# * Run as root: loading BPF objects requires CAP_BPF + CAP_SYS_ADMIN
+#   (and unprivileged_bpf_disabled sysctl must be 0, or process must be root).
+# * For non-root: install binary with file capabilities:
+#     sudo setcap cap_bpf,cap_sys_admin,cap_net_admin,cap_net_raw,cap_dac_override=eip /usr/local/bin/zqfw
+#   Then set User=zqfw Group=zqfw and NoNewPrivileges=true
+# * The daemon supports systemd watchdog (sd_notify WATCHDOG=1) when WatchdogSec is set.
+# * BPF maps can be persisted via --pin-dir /sys/fs/bpf/zqfw for fail-closed across restarts.
+# * On SIGTERM, the daemon enters fail-closed mode: enforces quarantines and keeps probes attached.

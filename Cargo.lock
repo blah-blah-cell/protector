@@ -273,6 +273,7 @@ dependencies = [
  "bytes",
  "clap",
  "humantime",
+ "ipnet",
  "libc",
  "rand 0.9.5",
  "reqwest",

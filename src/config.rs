@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::bail;
 use clap::Parser;
+use ipnet::IpNet;
 
 /// Name used to ask for automatic interface selection.
 const AUTO_IFACE: &str = "auto";
@@ -72,6 +73,11 @@ pub struct Cli {
     /// Directory where pinned BPF maps live (for troubleshooting).
     #[arg(long)]
     pub pin_dir: Option<PathBuf>,
+
+    /// Comma-separated list of CIDR prefixes (e.g. 10.0.0.0/8,192.168.1.0/24)
+    /// that are exempt from quarantine. Exact IPs also accepted (/32, /128).
+    #[arg(long, value_delimiter = ',')]
+    pub allowlist: Vec<String>,
 }
 
 fn humantime(s: &str) -> Result<Duration, String> {
@@ -87,6 +93,8 @@ pub struct Config {
     pub block_ttl_ns: u64,
     /// Whether to enable whole-IP quarantine.
     pub block_ip: bool,
+    /// Parsed allowlist entries (CIDR or exact IPs).
+    pub allowlist: Vec<IpNet>,
 }
 
 impl Config {
@@ -120,10 +128,21 @@ impl Config {
             .as_nanos()
             .min(u64::MAX as u128) as u64;
         let block_ip = cli.block_ip;
+
+        // Parse allowlist CIDR strings
+        let mut allowlist = Vec::new();
+        for cidr in &cli.allowlist {
+            match cidr.parse::<IpNet>() {
+                Ok(net) => allowlist.push(net),
+                Err(e) => bail!("invalid allowlist CIDR '{cidr}': {e}"),
+            }
+        }
+
         Ok(Config {
             cli,
             block_ttl_ns,
             block_ip,
+            allowlist,
         })
     }
 }

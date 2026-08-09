@@ -2,15 +2,22 @@
 //! probes, and exposes typed handles over the shared maps.
 
 use std::os::fd::AsFd as _;
+use std::os::fd::AsRawFd;
 
 use anyhow::{Context, Result};
 use aya::include_bytes_aligned;
 use aya::maps::{Array, HashMap, MapData, RingBuf};
 use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpMode};
 use aya::{Ebpf, EbpfLoader};
+use libc::SYS_bpf;
+
+// BPF command constants (from Linux kernel headers)
+const BPF_MAP_PIN: u32 = 15;
+const BPF_MAP_UNPIN: u32 = 16;
 
 use crate::config::Config;
 use crate::protocol::*;
+use ipnet::IpNet;
 
 pub struct BpfManager {
     /// Kept alive: holds the programs and their attach links.
@@ -25,6 +32,7 @@ pub struct BpfManager {
     pub flows: HashMap<MapData, FlowKey, FlowMetrics>,
     pub blocklist: HashMap<MapData, FlowKey, BlockEntry>,
     pub blocklist_ip: HashMap<MapData, IpKey, BlockEntry>,
+    pub allowlist: HashMap<MapData, IpKey, u8>,
     pub events: RingBuf<MapData>,
     pub ctl: Array<MapData, ControlCfg>,
     pub counters: Array<MapData, CounterVec>,
@@ -72,12 +80,40 @@ impl BpfManager {
             HashMap::try_from(ebpf.take_map("blocklist").context("missing blocklist map")?)?;
         let blocklist_ip: HashMap<MapData, IpKey, BlockEntry> =
             HashMap::try_from(ebpf.take_map("blocklist_ip").context("missing blocklist_ip map")?)?;
+        let allowlist: HashMap<MapData, IpKey, u8> =
+            HashMap::try_from(ebpf.take_map("allowlist").context("missing allowlist map")?)?;
         let events: RingBuf<MapData> =
             RingBuf::try_from(ebpf.take_map("events").context("missing events map")?)?;
         let ctl: Array<MapData, ControlCfg> =
             Array::try_from(ebpf.take_map("ctl").context("missing ctl map")?)?;
         let counters: Array<MapData, CounterVec> =
             Array::try_from(ebpf.take_map("counters").context("missing counters map")?)?;
+
+// Pin maps if --pin-dir is specified
+        if let Some(pin_dir) = &cfg.cli.pin_dir {
+            std::fs::create_dir_all(pin_dir).context("create pin directory")?;
+
+            // Pin each map using the InnerMap trait's fd() method directly
+            // (each concrete map type implements InnerMap and has fd() method)
+            let pin_map = |map: &dyn aya::maps::InnerMap, name: &str| -> anyhow::Result<()> {
+                let path = pin_dir.join(name);
+                let fd = map.fd().as_fd().as_raw_fd();
+                let path_cstr = std::ffi::CString::new(path.to_string_lossy().as_bytes())?;
+                let ret = unsafe { libc::syscall(SYS_bpf, BPF_MAP_PIN, fd, path_cstr.as_ptr()) };
+                if ret < 0 {
+                    return Err(anyhow::anyhow!("failed to pin {} map: {}", name, std::io::Error::last_os_error()));
+                }
+                Ok(())
+            };
+
+            pin_map(&flows, "flows")?;
+            pin_map(&blocklist, "blocklist")?;
+            pin_map(&blocklist_ip, "blocklist_ip")?;
+            pin_map(&allowlist, "allowlist")?;
+            pin_map(&ctl, "ctl")?;
+            pin_map(&counters, "counters")?;
+            tracing::info!("BPF maps pinned to {}", pin_dir.display());
+        }
 
         Ok(BpfManager {
             ebpf,
@@ -87,6 +123,7 @@ impl BpfManager {
             flows,
             blocklist,
             blocklist_ip,
+            allowlist,
             events,
             ctl,
             counters,
@@ -122,6 +159,30 @@ impl BpfManager {
         self.ctl.set(CTL_INDEX, ctl_cfg, 0)?;
         Ok(())
     }
+
+    /// Populate the allowlist map by expanding CIDR prefixes to individual IPs.
+    /// Limited to 65536 entries per prefix to prevent resource exhaustion.
+    pub fn populate_allowlist(&mut self, allowlist: &[IpNet]) -> Result<()> {
+        const MAX_IPS_PER_PREFIX: u32 = 65536;
+        for net in allowlist {
+            let prefix_len = net.prefix_len();
+            let num_ips = 1u32 << (net.max_prefix_len() - prefix_len);
+            if num_ips > MAX_IPS_PER_PREFIX {
+                tracing::warn!(
+                    "allowlist prefix {} expands to {} IPs (limit {}), skipping",
+                    net,
+                    num_ips,
+                    MAX_IPS_PER_PREFIX
+                );
+                continue;
+            }
+            for ip in net.hosts() {
+                let ip_key = crate::protocol::IpKey::from_ip(ip);
+                self.allowlist.insert(&ip_key, &1u8, 0)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Thin in-process interface every data plane implements, so the supervisor
@@ -132,6 +193,7 @@ pub trait DataPlane {
     fn block_ip(&mut self, ip: &IpKey, entry: BlockEntry) -> Result<()>;
     fn unblock_ip(&mut self, ip: &IpKey) -> Result<()>;
     fn apply_control(&mut self, enforce: bool, cfg: &Config) -> Result<()>;
+    fn populate_allowlist(&mut self, allowlist: &[IpNet]) -> Result<()>;
     fn snapshot_flows(&mut self) -> Vec<(FlowKey, FlowMetrics)>;
     fn snapshot_counters(&mut self) -> CounterVec;
     /// Drain any pending kernel events (ring buffer). Real planes return the
@@ -180,6 +242,10 @@ impl DataPlane for BpfManager {
 
     fn apply_control(&mut self, enforce: bool, cfg: &Config) -> Result<()> {
         BpfManager::apply_control(self, enforce, cfg)
+    }
+
+    fn populate_allowlist(&mut self, allowlist: &[IpNet]) -> Result<()> {
+        BpfManager::populate_allowlist(self, allowlist)
     }
 
     fn snapshot_flows(&mut self) -> Vec<(FlowKey, FlowMetrics)> {

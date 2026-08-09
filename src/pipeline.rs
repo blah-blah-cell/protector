@@ -80,6 +80,15 @@ impl Supervisor {
             .await
             .apply_control(self.enforce, &self.cfg)?;
 
+        // Populate allowlist if configured
+        if !self.cfg.allowlist.is_empty() {
+            self.plane
+                .lock()
+                .await
+                .populate_allowlist(&self.cfg.allowlist)?;
+            tracing::info!("allowlist populated with {} entries", self.cfg.allowlist.len());
+        }
+
         self.audit.lock().await.log(AuditEvent {
             event: "supervisor_started",
             level: "info",
@@ -591,6 +600,7 @@ mod regression_tests {
             audit: "/dev/null".into(),
             metrics_addr: "127.0.0.1:9790".parse().unwrap(),
             pin_dir: None,
+            allowlist: Vec::new(),
         };
         Config::from_env().unwrap()
     }

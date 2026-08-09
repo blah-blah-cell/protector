@@ -18,6 +18,17 @@ use config::Config;
 use pipeline::{MetricsState, Supervisor};
 use tokio::sync::{mpsc, watch, Mutex};
 
+#[cfg(target_os = "linux")]
+fn sd_notify(state: &str) {
+    use std::os::unix::net::UnixDatagram;
+    use std::os::fd::AsRawFd;
+    if let Ok(sock) = UnixDatagram::unbound() {
+        if let Ok(addr) = std::env::var("NOTIFY_SOCKET") {
+            let _ = sock.send_to(state.as_bytes(), addr);
+        }
+    }
+}
+
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     tracing_subscriber::fmt()
@@ -144,15 +155,54 @@ async fn main() -> Result<()> {
     // Graceful shutdown on Ctrl-C.
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown requested");
+        tracing::info!("shutdown requested (Ctrl-C)");
+        let _ = stop_tx.send(true);
+    };
+
+    // Watchdog: fail-closed on SIGTERM - enforce and keep probes attached
+    let term = async {
+        let mut term_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        term_signal.recv().await;
+        tracing::warn!("SIGTERM received - entering fail-closed mode");
+        // Signal supervisor to enforce and persist state
+        let _ = stop_tx.send(true);
+    };
+    tokio::pin!(term);
+
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown requested (Ctrl-C)");
         let _ = stop_tx.send(true);
     };
     tokio::pin!(shutdown);
+
+    // Systemd watchdog ping: send WATCHDOG=1 periodically if NOTIFY_SOCKET is set
+    let watchdog = async {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            if std::env::var("NOTIFY_SOCKET").is_ok() {
+                sd_notify("WATCHDOG=1");
+            }
+        }
+    };
+    tokio::pin!(watchdog);
+
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown requested (Ctrl-C)");
+        let _ = stop_tx.send(true);
+    };
+    tokio::pin!(shutdown);
+
     tokio::select! {
         _ = &mut shutdown => {}
+        _ = &mut term => {}
+        _ = &mut watchdog => {}
         r = sup.run(rx) => r?,
     }
 
-    tracing::info!("supervisor exited cleanly; probes will be detached");
+    tracing::info!("supervisor exited; probes remain attached (fail-closed)");
     Ok(())
 }

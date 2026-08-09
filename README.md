@@ -26,11 +26,13 @@ sweep, enforcement latency **0.9–21 µs**, in-kernel drops confirmed 1:1 with
 
 ## Requirements
 
-* **Linux 5.8+** (BFT/BTF support recommended) with a NIC you can attach XDP to.
+* **Linux 5.8+** (BTF support recommended) with a NIC you can attach XDP to.
 * **Root** (or `CAP_BPF + CAP_NET_ADMIN`) to load the BPF objects in real mode.
   Mock mode needs neither.
 * **clang/LLVM** (to compile the C probes), a **Rust toolchain**, `libelf`,
   and optionally `linux-headers-$(uname -r)`.
+* For BPF map persistence: `bpftool` and a mounted BPF filesystem
+  (`mount -t bpf bpf /sys/fs/bpf`).
 
 ## Install
 
@@ -77,6 +79,51 @@ sudo systemctl enable --now zqfw          # attaches to your default-route NIC, 
 sudo journalctl -fu zqfw
 ```
 
+### Advanced features
+
+#### Allowlist trusted sources
+Exempt trusted CIDRs from quarantine (e.g. management networks, DNS servers):
+
+```bash
+sudo zqfw --iface auto --block-ip --allowlist 10.0.0.0/8,192.168.1.0/24
+```
+
+The allowlist supports CIDR notation and exact IPs (`/32`, `/128`). Expands prefixes
+up to 65,536 IPs per prefix (larger subnets skipped with warning).
+
+#### BPF map persistence (fail-closed across restarts)
+Pin BPF maps to the filesystem so quarantines survive daemon restarts:
+
+```bash
+sudo mount -t bpf bpf /sys/fs/bpf   # once at boot
+sudo zqfw --pin-dir /sys/fs/bpf/zqfw ...
+```
+
+Maps are pinned under `/sys/fs/bpf/zqfw/` (`flows`, `blocklist`, `blocklist_ip`,
+`allowlist`, `ctl`, `counters`). On restart, the daemon reuses the pinned maps,
+preserving active quarantines (fail-closed behavior).
+
+#### Fail-closed on shutdown
+On `SIGTERM`, the daemon enters fail-closed mode: enforces current quarantines,
+pins maps (if `--pin-dir` set), and keeps probes attached. Network remains
+protected until explicit `unblock` or reboot.
+
+```bash
+sudo kill -TERM $(pgrep zqfw)   # triggers fail-closed
+```
+
+#### Systemd hardening
+The `packaging/zqfw.service` includes:
+- `Type=notify` with systemd watchdog (`WatchdogSec=30`)
+- `Restart=always` with `StartLimitBurst=3`
+- Capability bounding set (`CAP_BPF`, `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_DAC_OVERRIDE`)
+- Filesystem protection (`ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`)
+- System call filtering (`@system-service @clock @network @bpf @resources @file-system`)
+- Resource limits (`LimitNOFILE=65536`, `LimitMEMLOCK=infinity`, `MemoryMax=512M`)
+- `EnvironmentFile=/etc/default/zqfw` for config overrides
+
+Config via `/etc/default/zqfw` (see `packaging/zqfw.env` example).
+
 ## Usage
 
 ### Rootless demo (no BPF, no root)
@@ -114,6 +161,8 @@ sudo zqfw --iface eth0 --block-ip --monitor --reap-interval 2s --quarantine 30s
 | `--reap-interval` | 5s | supervisor re-evaluation period |
 | `--monitor` | off | never drop — observe/audit only |
 | `--block-ip` | off | whole-IP quarantines on systemic behaviour (port scan) |
+| `--allowlist` | none | comma-separated CIDRs to exempt from quarantine |
+| `--pin-dir` | none | directory to pin BPF maps for fail-closed persistence |
 | `--metrics-addr` | 127.0.0.1:9790 | Prometheus text endpoint |
 | `--audit` | `-` | JSONL audit path (`-` for stdout) |
 

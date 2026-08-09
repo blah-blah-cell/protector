@@ -11,6 +11,7 @@ use anyhow::Result;
 use crate::bpf::DataPlane;
 use crate::config::Config;
 use crate::protocol::*;
+use ipnet::IpNet;
 
 #[derive(Debug)]
 pub struct MockDataPlane {
@@ -105,6 +106,12 @@ impl DataPlane for MockDataPlane {
 
     fn apply_control(&mut self, enforce: bool, _cfg: &Config) -> Result<()> {
         self.enforce = enforce;
+        Ok(())
+    }
+
+    fn populate_allowlist(&mut self, allowlist: &[IpNet]) -> Result<()> {
+        // Mock: just store the allowlist for reference (no actual enforcement)
+        tracing::debug!("mock: allowlist populated with {} entries", allowlist.len());
         Ok(())
     }
 

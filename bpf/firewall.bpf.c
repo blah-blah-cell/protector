@@ -45,6 +45,7 @@
 
 #define MAX_FLOWS 262144
 #define MAX_BLOCKLIST 262144
+#define MAX_ALLOWLIST 4096
 #define RINGBUF_BYTES (1u << 22) /* 4 MiB */
 
 /* control / config flags */
@@ -169,6 +170,13 @@ struct {
     __type(key, struct ip_key);
     __type(value, struct block_entry);
 } blocklist_ip SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ALLOWLIST);
+    __type(key, struct ip_key);
+    __type(value, __u8);
+} allowlist SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -460,6 +468,16 @@ static __always_inline enum act inspect(void *data, void *data_end, __u32 len)
         if (c)
             __sync_fetch_and_add(&c->malformed, 1);
         return ACT_PASS;
+    }
+
+    /* 0. Allowlist check - bypass all enforcement for trusted sources */
+    struct ip_key ipk = {};
+    for (int i = 0; i < 4; i++) {
+        ipk.addr[i] = ctx.key.saddr[i];
+    }
+    __u8 *val = bpf_map_lookup_elem(&allowlist, &ipk);
+    if (val) {
+        return ACT_PASS; // Source is allowlisted, bypass all enforcement
     }
 
     __u32 zero = 0;
