@@ -18,12 +18,15 @@ use config::Config;
 use pipeline::{MetricsState, Supervisor};
 use tokio::sync::{mpsc, watch, Mutex};
 
+/// Best-effort `sd_notify(3)` replacement: sends a datagram to the socket
+/// named by `$NOTIFY_SOCKET` (set by systemd when `Type=notify`). No-op if
+/// the variable is unset or the socket can't be reached, so it is always
+/// safe to call outside of systemd.
 #[cfg(target_os = "linux")]
 fn sd_notify(state: &str) {
     use std::os::unix::net::UnixDatagram;
-    use std::os::fd::AsRawFd;
-    if let Ok(sock) = UnixDatagram::unbound() {
-        if let Ok(addr) = std::env::var("NOTIFY_SOCKET") {
+    if let Ok(addr) = std::env::var("NOTIFY_SOCKET") {
+        if let Ok(sock) = UnixDatagram::unbound() {
             let _ = sock.send_to(state.as_bytes(), addr);
         }
     }
@@ -158,26 +161,23 @@ async fn main() -> Result<()> {
         tracing::info!("shutdown requested (Ctrl-C)");
         let _ = stop_tx.send(true);
     };
+    tokio::pin!(shutdown);
 
-    // Watchdog: fail-closed on SIGTERM - enforce and keep probes attached
+    // Fail-closed on SIGTERM: stop the supervisor loop but leave the eBPF
+    // probes attached so any active quarantines keep being enforced by the
+    // kernel until the process is fully reaped or the host reboots.
     let term = async {
-        let mut term_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
+        let mut term_signal =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
         term_signal.recv().await;
         tracing::warn!("SIGTERM received - entering fail-closed mode");
-        // Signal supervisor to enforce and persist state
         let _ = stop_tx.send(true);
     };
     tokio::pin!(term);
 
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown requested (Ctrl-C)");
-        let _ = stop_tx.send(true);
-    };
-    tokio::pin!(shutdown);
-
-    // Systemd watchdog ping: send WATCHDOG=1 periodically if NOTIFY_SOCKET is set
+    // Systemd watchdog ping: send WATCHDOG=1 periodically if NOTIFY_SOCKET is
+    // set (i.e. the unit uses `Type=notify` + `WatchdogSec=`).
     let watchdog = async {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
@@ -188,13 +188,6 @@ async fn main() -> Result<()> {
         }
     };
     tokio::pin!(watchdog);
-
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown requested (Ctrl-C)");
-        let _ = stop_tx.send(true);
-    };
-    tokio::pin!(shutdown);
 
     tokio::select! {
         _ = &mut shutdown => {}
